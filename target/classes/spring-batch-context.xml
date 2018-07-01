@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:batch="http://www.springframework.org/schema/batch"
+	xmlns:context="http://www.springframework.org/schema/context"
+	xmlns:jdbc="http://www.springframework.org/schema/jdbc" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.springframework.org/schema/batch 
+		http://www.springframework.org/schema/batch/spring-batch-3.0.xsd
+		http://www.springframework.org/schema/beans 
+		http://www.springframework.org/schema/beans/spring-beans-4.0.xsd
+		http://www.springframework.org/schema/beans 
+		http://www.springframework.org/schema/jdbc/spring-jdbc.xsd 
+		http://www.springframework.org/schema/context 
+		http://www.springframework.org/schema/context/spring-context.xsd">
+
+
+	<context:property-placeholder location="classpath:sqlQueries.properties" />
+
+	<!-- xmlns:util="http://www.springframework.org/schema/util" -->
+	<!-- JobRepository and JobLauncher are configuration/setup classes -->
+	<bean id="reconDTO" class="com.capitalone.sage.batch.bean.ReconDTO"
+		scope="prototype"></bean>
+
+	<bean id="stepListener" class="com.capitalone.sage.batch.listener.StepListener" />
+
+	<bean id="stepScope" class="org.springframework.batch.core.scope.StepScope">
+		<property name="autoProxy" value="true" />
+	</bean>
+
+	<bean id="banProcessor" class="com.capitalone.sage.batch.processor.BANProcessor"></bean>
+
+	<bean id="banWriter" class="com.capitalone.sage.batch.writer.BANWriter"></bean>
+
+	<bean id="inMemoryQueueReader" class="com.capitalone.sage.batch.reader.InMemoryQueueReader">
+		<property name="queue" ref="inMemoryQueue" />
+		<property name="timeoutSeconds" value="300" />
+	</bean>
+
+	<bean id="inMemoryQueueWriter" class="com.capitalone.sage.batch.writer.InMemoryQueueWriter">
+		<property name="queue" ref="inMemoryQueue" />
+		<property name="timeoutSeconds" value="300" />
+	</bean>
+
+	<bean id="waitForInMemoryQueueDecider"
+		class="com.capitalone.coaf_cs.batch.decider.WaitForInMemoryQueueDecider">
+		<property name="queue" ref="inMemoryQueue" />
+		<property name="timeoutSeconds" value="1800" />
+		<property name="readerStep" ref="readFromBestDB"></property>
+	</bean>
+
+	<bean id="inMemoryQueue" class="java.util.concurrent.ArrayBlockingQueue">
+		<constructor-arg value="100000" />
+	</bean>
+
+	<bean id="jobRepository"
+		class="org.springframework.batch.core.repository.MapJobRepositoryFactoryBean" />
+
+	<bean id="jobLauncher"
+		class="org.springframework.batch.core.launch.support.SimpleJobLauncher">
+		<property name="jobRepository" ref="jobRepository" />
+	</bean>
+
+	<!-- Item Reader reads a complete line one by one from input file -->
+	<bean id="dbItemReader"
+		class="org.springframework.batch.item.database.JdbcPagingItemReader"
+		scope="step">
+		<!-- <property name="resource" value="classpath:person.txt" /> -->
+		<property name="dataSource" ref="dataSource" />
+		<property name="queryProvider">
+			<bean
+				class="org.springframework.batch.item.database.support.SqlPagingQueryProviderFactoryBean">
+				<property name="dataSource" ref="dataSource" />
+				<property name="selectClause" value="${sql.readhsqlSelectClause}" />
+				<property name="fromClause" value="${sql.readhsqlFromClause}" />
+				<property name="sortKey" value="id" />
+			</bean>
+		</property>
+
+		<property name="pageSize" value="10000" />
+		<property name="rowMapper">
+			<bean class="org.springframework.core.BeanPropertyRowMapper">
+				<property name="mappedClass">
+					<bean class="com.capitalone.sage.batch.bean.ReconDTO" />
+				</property>
+			</bean>
+		</property>
+	</bean>
+
+	<bean id="dbItemWriter"
+		class="org.springframework.batch.item.database.JdbcBatchItemWriter">
+		<property name="dataSource" ref="datasource" />
+		<property name="sql">
+			<value>
+				[CDATA[
+				insert into persondetails(id, name, bankaccountnumber,
+				routingNo) values (id:, :name,:bankaccountNumber,:abaNum)
+				]]
+			</value>
+		</property>
+		<!-- It will take care matching between object property and sql name parameter -->
+		<property name="itemSqlParameterSourceProvider">
+			<bean
+				class="org.springframework.batch.item.database.BeanPropertyItemSqlParameterSourceProvider" />
+		</property>
+	</bean>
+
+
+	<!-- Actual Job -->
+	<batch:job id="payment-accounts-tokenization">
+		<batch:split id="main" task-executor="simpleAsyncTaskExecutor">
+			<batch:flow>
+				<batch:step id="readFromDB">
+					<batch:tasklet task-executor="threadPoolTaskExecutor"
+						throttle-limit="20">
+						<batch:chunk reader="dbItemReader" writer="inMemoryQueueWriter"
+							commit-interval="100" />
+					</batch:tasklet>
+				</batch:step>
+			</batch:flow>
+			<batch:flow>
+				<batch:decision id="waitForQueue" decider="waitForInMemoryQueueDecider">
+					<batch:next on="CONTINUE" to="processStep" />
+					<batch:end on="ABORT" />
+				</batch:decision>
+				<batch:step id="processStep">
+					<batch:tasklet task-executor="threadPoolTaskExecutor"
+						throttle-limit="20">
+						<batch:chunk reader="inMemoryQueueReader" processor="banProcessor"
+							writer="dbItemWriter" commit-interval="100" />
+					</batch:tasklet>
+					<batch:listeners>
+						<batch:listener ref="stepListener" />
+					</batch:listeners>
+				</batch:step>
+			</batch:flow>
+		</batch:split>
+	</batch:job>
+
+	<!-- <bean id="dataSource" class="org.apache.commons.dbcp.BasicDataSource" 
+		lazy-init="true" destroy-method="close"> <property name="driverClassName" 
+		value="org.hsqldb.jdbcDriver" /> <property name="url" value="jdbc:hsqldb:hsql://localhost/testdb" 
+		/> <property name="username" value="sa" /> <property name="password" value="" 
+		/> </bean> -->
+
+	<bean id="dataSource"
+		class="org.springframework.jdbc.datasource.DriverManagerDataSource">
+		<property name="driverClassName" value="com.mysql.jdbc.Driver" />
+		<property name="url" value="jdbc:mysql://localhost:3306/shubhaDB" />
+		<property name="username" value="root" />
+		<property name="password" value="" />
+
+	</bean>
+
+	<bean id="threadpoolTaskExecutor"
+		class="org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor">
+		<property name="corePoolSize" value="20" />
+		<property name="maxPoolSize" value="20" />
+	</bean>
+
+
+	<!-- Step will need a transaction manager -->
+	<bean id="transactionManager"
+		class="org.springframework.batch.support.transaction.ResourcelessTransactionManager" />
+
+
+
+</beans>
